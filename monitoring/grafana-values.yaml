@@ -1,0 +1,40 @@
+adminUser: admin
+adminPassword: admin123
+
+service:
+  type: NodePort
+  nodePort: 32000
+
+persistence:
+  enabled: true
+  size: 2Gi
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        url: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+        access: proxy
+        isDefault: true
+
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: default
+        orgId: 1
+        folder: ""
+        type: file
+        disableDeletion: false
+        options:
+          path: /var/lib/grafana/dashboards/default
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 300m
+    memory: 256Mi

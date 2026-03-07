@@ -1,0 +1,21 @@
+---
+- name: Download minikube binary
+  get_url:
+    url: "https://storage.googleapis.com/minikube/releases/{{ minikube_version }}/minikube-linux-amd64"
+    dest: /usr/local/bin/minikube
+    mode: "0755"
+    force: yes
+
+- name: Verify minikube
+  command: minikube version
+  register: minikube_out
+  changed_when: false
+
+- name: Show minikube version
+  debug:
+    msg: "{{ minikube_out.stdout }}"
+
+- name: Configure minikube to use docker driver
+  become: false
+  command: minikube config set driver docker
+  changed_when: false

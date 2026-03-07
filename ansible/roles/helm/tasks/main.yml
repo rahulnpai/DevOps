@@ -1,0 +1,40 @@
+---
+- name: Download Helm install script
+  get_url:
+    url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+    dest: /tmp/get-helm.sh
+    mode: "0700"
+
+- name: Install Helm
+  command: /tmp/get-helm.sh --version {{ helm_version }}
+  args:
+    creates: /usr/local/bin/helm
+
+- name: Remove Helm install script
+  file:
+    path: /tmp/get-helm.sh
+    state: absent
+
+- name: Add Prometheus Helm repo
+  become: false
+  command: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+  changed_when: false
+
+- name: Add Grafana Helm repo
+  become: false
+  command: helm repo add grafana https://grafana.github.io/helm-charts
+  changed_when: false
+
+- name: Update Helm repos
+  become: false
+  command: helm repo update
+  changed_when: false
+
+- name: Verify Helm installation
+  command: helm version
+  register: helm_ver
+  changed_when: false
+
+- name: Show Helm version
+  debug:
+    msg: "{{ helm_ver.stdout }}"

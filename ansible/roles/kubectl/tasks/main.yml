@@ -1,0 +1,21 @@
+---
+- name: Download kubectl binary
+  get_url:
+    url: "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
+    dest: /usr/local/bin/kubectl
+    mode: "0755"
+    force: yes
+
+- name: Verify kubectl
+  command: kubectl version --client
+  register: kubectl_out
+  changed_when: false
+
+- name: Show kubectl version
+  debug:
+    msg: "{{ kubectl_out.stdout }}"
+
+- name: Install kubectl bash completion
+  shell: kubectl completion bash > /etc/bash_completion.d/kubectl
+  args:
+    creates: /etc/bash_completion.d/kubectl

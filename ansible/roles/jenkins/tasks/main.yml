@@ -1,0 +1,43 @@
+---
+- name: Create Jenkins data directory
+  file:
+    path: /var/jenkins_home
+    state: directory
+    mode: "0755"
+    owner: "{{ current_user }}"
+
+- name: Pull Jenkins LTS Docker image
+  community.docker.docker_image:
+    name: jenkins/jenkins:lts-jdk17
+    source: pull
+
+- name: Start Jenkins container
+  community.docker.docker_container:
+    name: jenkins
+    image: jenkins/jenkins:lts-jdk17
+    state: started
+    restart_policy: unless-stopped
+    privileged: yes
+    user: root
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - "/var/jenkins_home:/var/jenkins_home"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/usr/bin/docker:/usr/bin/docker"
+    env:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+
+- name: Wait for Jenkins to start
+  uri:
+    url: "http://localhost:8080"
+    status_code: 200
+  register: jenkins_status
+  until: jenkins_status.status == 200
+  retries: 30
+  delay: 10
+
+- name: Show Jenkins URL
+  debug:
+    msg: "Jenkins available at http://localhost:8080"

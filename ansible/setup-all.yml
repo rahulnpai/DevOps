@@ -1,0 +1,72 @@
+---
+# ══════════════════════════════════════════════════════════════════════════════
+#  Master playbook — provisions entire DevOps toolchain in one command:
+#  ansible-playbook -i inventory.ini setup-all.yml -K
+# ══════════════════════════════════════════════════════════════════════════════
+- name: Full DevOps Environment Setup
+  hosts: local
+  become: true
+  gather_facts: true
+
+  vars:
+    kubectl_version:   "v1.29.3"
+    minikube_version:  "v1.33.0"
+    terraform_version: "1.8.2"
+    helm_version:      "v3.14.4"
+    jenkins_port:      8080
+    registry_port:     5000
+    user_home:         "{{ ansible_env.HOME }}"
+    current_user:      "{{ ansible_env.USER }}"
+
+  pre_tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install common dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - unzip
+          - git
+          - python3-pip
+          - jq
+        state: present
+
+  roles:
+    - role: docker
+    - role: kubectl
+    - role: minikube
+    - role: jenkins
+    - role: terraform_role
+    - role: helm
+
+  post_tasks:
+    - name: Add user to docker group
+      user:
+        name: "{{ current_user }}"
+        groups: docker
+        append: yes
+
+    - name: Print setup summary
+      debug:
+        msg: |
+          ============================================================
+          DevOps environment setup COMPLETE
+          ------------------------------------------------------------
+          Docker:    {{ ansible_facts.packages['docker-ce'][0].version | default('installed') }}
+          kubectl:   {{ kubectl_version }}
+          minikube:  {{ minikube_version }}
+          Terraform: {{ terraform_version }}
+          Helm:      {{ helm_version }}
+          Jenkins:   http://localhost:{{ jenkins_port }}
+          Registry:  localhost:{{ registry_port }}
+          ============================================================
+          Run: newgrp docker   (to apply docker group without logout)
+          ============================================================

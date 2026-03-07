@@ -1,0 +1,341 @@
+// ── Jenkins Declarative Pipeline ─────────────────────────────────────────────
+pipeline {
+    agent {
+    docker {
+        image 'python:3.11'
+        args '-v /var/run/docker.sock:/var/run/docker.sock'
+    }
+}
+
+    // ── Environment ───────────────────────────────────────────────────────────
+    environment {
+        REGISTRY           = "localhost:5000"
+        IMAGE_NAME         = "devops-mca-app"
+        IMAGE_TAG          = "${BUILD_NUMBER}"
+        FULL_IMAGE         = "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+        LATEST_IMAGE       = "${REGISTRY}/${IMAGE_NAME}:latest"
+
+        K8S_NAMESPACE      = "devops-prod"
+        K8S_STAGING_NS     = "devops-staging"
+        K8S_DEPLOYMENT     = "devops-app"
+        KUBECONFIG_PATH    = "/var/jenkins_home/.kube/config"
+
+        DOCKER_BUILDKIT    = "1"
+
+        // Slack — configure "slack-webhook-url" secret text credential in Jenkins
+        SLACK_CHANNEL      = "#devops-alerts"
+        SLACK_CREDENTIAL   = "slack-webhook-url"
+
+        // Email — set DEFAULT_RECIPIENTS in Jenkins → Manage Jenkins → System
+        EMAIL_RECIPIENTS   = "${DEFAULT_RECIPIENTS}"
+    }
+
+    // ── Build options ─────────────────────────────────────────────────────────
+    options {
+        buildDiscarder(logRotator(numToKeepStr: "10"))
+        timeout(time: 45, unit: "MINUTES")
+        timestamps()
+        ansiColor("xterm")
+    }
+
+    // ── Triggers ──────────────────────────────────────────────────────────────
+    triggers {
+        pollSCM("H/5 * * * *")    // poll every 5 min (webhook fallback)
+    }
+
+    stages {
+
+        // ── 1. Checkout ───────────────────────────────────────────────────────
+        stage("Checkout") {
+            steps {
+                checkout scm
+                sh "git log --oneline -5"
+            }
+        }
+
+        // ── 2. Code Quality (flake8) ──────────────────────────────────────────
+        stage("Code Quality") {
+            steps {
+                sh """
+                    python3 -m venv .venv
+                    . .venv/bin/activate
+                    pip install --quiet flake8 -r app/requirements.txt
+                    echo "=== flake8 report ==="
+                    flake8 app/ \
+                        --max-line-length=120 \
+                        --statistics \
+                        --format=default \
+                        --tee --output-file=flake8-report.txt || true
+                    cat flake8-report.txt
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "flake8-report.txt", allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── 3. Tests + Coverage ───────────────────────────────────────────────
+        stage("Test") {
+            steps {
+                sh """
+                    . .venv/bin/activate
+                    pip install --quiet pytest pytest-asyncio httpx pytest-cov
+                    pytest app/tests/ -v --tb=short \
+                        --junitxml=test-results.xml \
+                        --cov=app \
+                        --cov-report=xml:coverage.xml \
+                        --cov-report=html:coverage-html \
+                        --cov-report=term-missing
+                """
+            }
+            post {
+                always {
+                    // Publish JUnit XML results
+                    junit allowEmptyResults: true, testResults: "test-results.xml"
+
+                    // Publish HTML coverage report
+                    publishHTML([
+                        allowMissing:         true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll:              true,
+                        reportDir:            "coverage-html",
+                        reportFiles:          "index.html",
+                        reportName:           "Coverage Report"
+                    ])
+
+                    // Archive XML coverage for badge/downstream use
+                    archiveArtifacts artifacts: "coverage.xml", allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── 4. Build Docker image ─────────────────────────────────────────────
+        stage("Build Image") {
+            steps {
+                sh """
+                    docker build \
+                        --file docker/Dockerfile \
+                        --tag  ${FULL_IMAGE} \
+                        --tag  ${LATEST_IMAGE} \
+                        --build-arg BUILD_DATE=\$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                        --build-arg VCS_REF=\$(git rev-parse --short HEAD) \
+                        --cache-from ${LATEST_IMAGE} \
+                        .
+                """
+            }
+        }
+
+        // ── 5. Security scan (Trivy) ──────────────────────────────────────────
+        stage("Security Scan") {
+            steps {
+                sh """
+                    docker run --rm \
+                        -v /var/run/docker.sock:/var/run/docker.sock \
+                        aquasec/trivy:latest image \
+                        --exit-code 0 \
+                        --severity HIGH,CRITICAL \
+                        --no-progress \
+                        --format table \
+                        ${FULL_IMAGE} || true
+                """
+            }
+        }
+
+        // ── 6. Push to registry ───────────────────────────────────────────────
+        stage("Push Image") {
+            steps {
+                sh """
+                    docker push ${FULL_IMAGE}
+                    docker push ${LATEST_IMAGE}
+                """
+            }
+        }
+
+        // ── 7. Deploy to Staging ──────────────────────────────────────────────
+        stage("Deploy to Staging") {
+            steps {
+                sh """
+                    export KUBECONFIG=${KUBECONFIG_PATH}
+
+                    # Ensure staging namespace exists
+                    kubectl create namespace ${K8S_STAGING_NS} \
+                        --dry-run=client -o yaml | kubectl apply -f -
+
+                    # Apply manifests to staging
+                    kubectl apply -f k8s/ -n ${K8S_STAGING_NS}
+
+                    # Rolling update with new image tag
+                    kubectl set image deployment/${K8S_DEPLOYMENT} \
+                        app=${FULL_IMAGE} \
+                        -n ${K8S_STAGING_NS}
+
+                    # Wait for rollout
+                    kubectl rollout status deployment/${K8S_DEPLOYMENT} \
+                        -n ${K8S_STAGING_NS} \
+                        --timeout=120s
+                """
+            }
+        }
+
+        // ── 8. Staging smoke test ─────────────────────────────────────────────
+        stage("Staging Smoke Test") {
+            steps {
+                sh """
+                    export KUBECONFIG=${KUBECONFIG_PATH}
+                    SVC_IP=\$(kubectl get svc devops-app-service -n ${K8S_STAGING_NS} \
+                               -o jsonpath='{.spec.clusterIP}')
+                    for i in 1 2 3 4 5; do
+                        STATUS=\$(curl -s -o /dev/null -w '%{http_code}' http://\$SVC_IP:8000/health)
+                        if [ "\$STATUS" = "200" ]; then
+                            echo "Staging smoke test PASSED (attempt \$i)"
+                            exit 0
+                        fi
+                        echo "Waiting... attempt \$i"
+                        sleep 10
+                    done
+                    echo "Staging smoke test FAILED"
+                    exit 1
+                """
+            }
+        }
+
+        // ── 9. Manual Approval Gate ───────────────────────────────────────────
+        stage("Approval") {
+            steps {
+                timeout(time: 10, unit: "MINUTES") {
+                    input(
+                        message: "Staging looks good. Deploy to Production?",
+                        ok:      "Approve & Deploy",
+                        submitter: "admin",   // restrict to admin user (adjust as needed)
+                        parameters: [
+                            text(
+                                name:         "RELEASE_NOTES",
+                                defaultValue: "",
+                                description:  "Optional release notes for this deployment"
+                            )
+                        ]
+                    )
+                }
+            }
+        }
+
+        // ── 10. Deploy to Production ──────────────────────────────────────────
+        stage("Deploy to Production") {
+            steps {
+                sh """
+                    export KUBECONFIG=${KUBECONFIG_PATH}
+                    kubectl config current-context
+
+                    # Apply namespace + manifests
+                    kubectl apply -f k8s/namespace.yaml
+                    kubectl apply -f k8s/ -n ${K8S_NAMESPACE}
+
+                    # Rolling update with new image tag
+                    kubectl set image deployment/${K8S_DEPLOYMENT} \
+                        app=${FULL_IMAGE} \
+                        -n ${K8S_NAMESPACE}
+
+                    # Wait for rollout
+                    kubectl rollout status deployment/${K8S_DEPLOYMENT} \
+                        -n ${K8S_NAMESPACE} \
+                        --timeout=120s
+                """
+            }
+        }
+
+        // ── 11. Production smoke test ─────────────────────────────────────────
+        stage("Production Smoke Test") {
+            steps {
+                sh """
+                    export KUBECONFIG=${KUBECONFIG_PATH}
+                    SVC_IP=\$(kubectl get svc devops-app-service -n ${K8S_NAMESPACE} \
+                               -o jsonpath='{.spec.clusterIP}')
+                    for i in 1 2 3 4 5; do
+                        STATUS=\$(curl -s -o /dev/null -w '%{http_code}' http://\$SVC_IP:8000/health)
+                        if [ "\$STATUS" = "200" ]; then
+                            echo "Production smoke test PASSED (attempt \$i)"
+                            exit 0
+                        fi
+                        echo "Waiting... attempt \$i"
+                        sleep 10
+                    done
+                    echo "Production smoke test FAILED"
+                    exit 1
+                """
+            }
+        }
+    }
+
+    // ── Post-pipeline ──────────────────────────────────────────────────────────
+    post {
+        success {
+            echo "Pipeline SUCCESS — image: ${FULL_IMAGE}"
+
+            // Slack notification
+            slackSend(
+                tokenCredentialId: "${SLACK_CREDENTIAL}",
+                channel:           "${SLACK_CHANNEL}",
+                color:             "good",
+                message:           """*SUCCESS* :white_check_mark: `${env.JOB_NAME}` build #${env.BUILD_NUMBER}
+Image: `${env.FULL_IMAGE}`
+<${env.BUILD_URL}|View Build>"""
+            )
+
+            // Email notification
+            emailext(
+                subject: "[SUCCESS] ${env.JOB_NAME} #${env.BUILD_NUMBER} deployed to Production",
+                body:    """
+<h2>Build Succeeded</h2>
+<p><b>Job:</b> ${env.JOB_NAME}</p>
+<p><b>Build:</b> #${env.BUILD_NUMBER}</p>
+<p><b>Image:</b> ${env.FULL_IMAGE}</p>
+<p><a href="${env.BUILD_URL}">View Build</a></p>
+                """,
+                mimeType: "text/html",
+                to:       "${EMAIL_RECIPIENTS}"
+            )
+        }
+
+        failure {
+            // Rollback production deployment
+            sh """
+                export KUBECONFIG=${KUBECONFIG_PATH}
+                echo 'Rolling back production deployment...'
+                kubectl rollout undo deployment/${K8S_DEPLOYMENT} \
+                    -n ${K8S_NAMESPACE} || true
+            """
+            echo "Pipeline FAILED — rollback triggered"
+
+            // Slack notification
+            slackSend(
+                tokenCredentialId: "${SLACK_CREDENTIAL}",
+                channel:           "${SLACK_CHANNEL}",
+                color:             "danger",
+                message:           """*FAILED* :x: `${env.JOB_NAME}` build #${env.BUILD_NUMBER}
+Rollback triggered on production.
+<${env.BUILD_URL}|View Build> | <${env.BUILD_URL}console|Console Log>"""
+            )
+
+            // Email notification
+            emailext(
+                subject: "[FAILED] ${env.JOB_NAME} #${env.BUILD_NUMBER} — rollback triggered",
+                body:    """
+<h2>Build Failed</h2>
+<p><b>Job:</b> ${env.JOB_NAME}</p>
+<p><b>Build:</b> #${env.BUILD_NUMBER}</p>
+<p><b>Action:</b> Production rollback triggered automatically.</p>
+<p><a href="${env.BUILD_URL}console">View Console Log</a></p>
+                """,
+                mimeType: "text/html",
+                to:       "${EMAIL_RECIPIENTS}"
+            )
+        }
+
+        always {
+            sh "docker image prune -f --filter 'until=24h' || true"
+            cleanWs()
+        }
+    }
+}

@@ -1,0 +1,125 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devops-app
+  namespace: devops-prod
+  labels:
+    app: devops-app
+    version: "1.0.0"
+    tier: backend
+    managed-by: jenkins
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: devops-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0         # zero-downtime
+  template:
+    metadata:
+      labels:
+        app: devops-app
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path:   "/metrics"
+        prometheus.io/port:   "8000"
+    spec:
+      # Security context for the Pod
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+
+      # Graceful shutdown
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: app
+          image: localhost:5000/devops-mca-app:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          env:
+            - name: APP_ENV
+              value: "production"
+            - name: APP_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['version']
+            - name: WORKERS
+              value: "2"
+
+          # Resource limits (production-grade)
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          # Liveness probe
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          # Readiness probe
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+
+          # Startup probe (for slow-starting containers)
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 3
+
+          # Container security context
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp-dir
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp-dir
+          emptyDir: {}
+
+      # Pod disruption budget friendly scheduling
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["devops-app"]
+                topologyKey: kubernetes.io/hostname
